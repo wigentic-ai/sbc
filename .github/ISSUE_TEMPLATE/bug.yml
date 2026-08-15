@@ -1,0 +1,27 @@
+name: Bug report
+description: Report reproducible behavior in sbc
+title: "bug: "
+labels: [bug]
+body:
+  - type: textarea
+    attributes:
+      label: What happened?
+      description: Include the command, expected result, and actual result.
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: sbc version
+      placeholder: sbc 0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    attributes:
+      label: Platform
+      options: [Windows, WSL, macOS, Linux]
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Additional context
+      description: Include terminal, SSH, and sbx versions when relevant. Never include secrets.
