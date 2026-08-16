@@ -2,9 +2,9 @@
 
 `sbc` connects your terminal to a Docker Sandbox—on this machine or over SSH.
 It can reconnect to the sandbox's coding agent, open a shell, or run any other
-interactive command. `Ctrl+V` works across the sandbox boundary: text pastes as
+interactive command. `Alt+V` works across the sandbox boundary: text pastes as
 text, while screenshots are copied into the sandbox and inserted as a readable
-path.
+path. `Ctrl+V` remains supported when the terminal sends it to `sbc`.
 
 ```console
 $ sbc config set-host build-server
@@ -49,7 +49,7 @@ $ sbc my-task -- bash
 $ sbc my-task -- python
 ```
 
-Press `Ctrl+V` inside a connected session. If the clipboard contains an image,
+Press `Alt+V` inside a connected session. If the clipboard contains an image,
 `sbc` streams it into sandbox `/tmp` and inserts a marker such as:
 
 ```text
@@ -57,7 +57,7 @@ Press `Ctrl+V` inside a connected session. If the clipboard contains an image,
 ```
 
 Temporary images are removed when the session ends. Use `--no-clipboard` to
-pass `Ctrl+V` through untouched.
+pass clipboard shortcuts through untouched.
 
 Set the default remote host once:
 

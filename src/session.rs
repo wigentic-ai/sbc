@@ -48,12 +48,6 @@ pub(crate) fn run(command: SessionCommand, target: Target, clipboard_enabled: bo
     let raw_mode = RawModeGuard::enable()?;
     install_signal_restore();
 
-    let output_thread = thread::spawn(move || {
-        let mut stdout = io::stdout().lock();
-        let _ = io::copy(&mut reader, &mut stdout);
-        let _ = stdout.flush();
-    });
-
     // Clipboard reads and sandbox uploads can take seconds. Keep them off the
     // input relay so terminal capability replies and keystrokes keep flowing.
     let (clipboard_sender, clipboard_receiver) = mpsc::channel();
@@ -73,7 +67,20 @@ pub(crate) fn run(command: SessionCommand, target: Target, clipboard_enabled: bo
 
     let input_writer = Arc::clone(&writer);
     let input_clipboard_sender = clipboard_sender.clone();
-    thread::spawn(move || input_loop(input_writer, input_clipboard_sender, clipboard_enabled));
+    let (input_ready_sender, input_ready_receiver) = mpsc::sync_channel(0);
+    thread::spawn(move || {
+        input_loop(
+            input_writer,
+            input_clipboard_sender,
+            clipboard_enabled,
+            input_ready_sender,
+        )
+    });
+
+    let output_thread = thread::spawn(move || {
+        let mut stdout = io::stdout().lock();
+        let _ = relay_output_after_input_ready(&mut reader, &mut stdout, input_ready_receiver);
+    });
 
     let resize_master = Arc::clone(&master);
     let resize_done = Arc::clone(&done);
@@ -99,12 +106,31 @@ pub(crate) fn run(command: SessionCommand, target: Target, clipboard_enabled: bo
     Ok(())
 }
 
+fn relay_output_after_input_ready<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    input_ready: mpsc::Receiver<()>,
+) -> io::Result<()> {
+    // Some TUIs query terminal capabilities during their first few milliseconds
+    // and use a short response window. Do not expose those queries to the outer
+    // terminal until the return path is already listening.
+    input_ready
+        .recv()
+        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "input relay stopped"))?;
+    io::copy(reader, writer)?;
+    writer.flush()
+}
+
 fn input_loop(
     writer: SharedWriter,
     clipboard_sender: mpsc::Sender<ClipboardRequest>,
     clipboard_enabled: bool,
+    ready: mpsc::SyncSender<()>,
 ) {
     let mut stdin = io::stdin().lock();
+    if ready.send(()).is_err() {
+        return;
+    }
     let mut buffer = [0_u8; 1024];
     let mut relay = InputRelay::default();
     loop {
@@ -161,6 +187,14 @@ impl InputRelay {
         let mut paste_count = 0;
 
         while cursor < bytes.len() {
+            if bytes[cursor..].starts_with(b"\x1bv") {
+                writer.write_all(&bytes[plain_start..cursor])?;
+                paste_count += 1;
+                cursor += 2;
+                plain_start = cursor;
+                continue;
+            }
+
             if bytes[cursor] == CTRL_V {
                 writer.write_all(&bytes[plain_start..cursor])?;
                 paste_count += 1;
@@ -184,17 +218,17 @@ impl InputRelay {
                 return Ok(paste_count);
             };
             let sequence_end = cursor + sequence_end;
-            match ctrl_v_sequence(&bytes[cursor..sequence_end]) {
-                CtrlVSequence::Press => {
+            match clipboard_shortcut_sequence(&bytes[cursor..sequence_end]) {
+                ShortcutSequence::Press => {
                     writer.write_all(&bytes[plain_start..cursor])?;
                     paste_count += 1;
                     plain_start = sequence_end;
                 }
-                CtrlVSequence::Release => {
+                ShortcutSequence::Release => {
                     writer.write_all(&bytes[plain_start..cursor])?;
                     plain_start = sequence_end;
                 }
-                CtrlVSequence::Other => {}
+                ShortcutSequence::Other => {}
             }
             cursor = sequence_end;
         }
@@ -213,58 +247,58 @@ fn csi_sequence_end(input: &[u8]) -> Option<usize> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CtrlVSequence {
+enum ShortcutSequence {
     Press,
     Release,
     Other,
 }
 
-fn ctrl_v_sequence(sequence: &[u8]) -> CtrlVSequence {
+fn clipboard_shortcut_sequence(sequence: &[u8]) -> ShortcutSequence {
     let Some((&final_byte, body)) = sequence.split_last() else {
-        return CtrlVSequence::Other;
+        return ShortcutSequence::Other;
     };
     let Some(parameters) = body.strip_prefix(b"\x1b[") else {
-        return CtrlVSequence::Other;
+        return ShortcutSequence::Other;
     };
 
     match final_byte {
         // Kitty's keyboard protocol, used by current Windows Terminal.
-        b'u' => kitty_ctrl_v(parameters),
+        b'u' => kitty_clipboard_shortcut(parameters),
         // XTerm's modifyOtherKeys encoding, used by some nested terminals.
-        b'~' => modify_other_keys_ctrl_v(parameters),
-        _ => CtrlVSequence::Other,
+        b'~' => modify_other_keys_clipboard_shortcut(parameters),
+        _ => ShortcutSequence::Other,
     }
 }
 
-fn kitty_ctrl_v(parameters: &[u8]) -> CtrlVSequence {
+fn kitty_clipboard_shortcut(parameters: &[u8]) -> ShortcutSequence {
     let mut fields = parameters.split(|byte| *byte == b';');
     if parameter_number(fields.next()) != Some(u16::from(b'v')) {
-        return CtrlVSequence::Other;
+        return ShortcutSequence::Other;
     }
     let Some(modifiers_and_event) = fields.next() else {
-        return CtrlVSequence::Other;
+        return ShortcutSequence::Other;
     };
     let mut parts = modifiers_and_event.split(|byte| *byte == b':');
-    if !is_ctrl_only(parameter_number(parts.next())) {
-        return CtrlVSequence::Other;
+    if !is_clipboard_modifier(parameter_number(parts.next())) {
+        return ShortcutSequence::Other;
     }
 
     match parameter_number(parts.next()).unwrap_or(1) {
-        1 | 2 => CtrlVSequence::Press,
-        3 => CtrlVSequence::Release,
-        _ => CtrlVSequence::Other,
+        1 | 2 => ShortcutSequence::Press,
+        3 => ShortcutSequence::Release,
+        _ => ShortcutSequence::Other,
     }
 }
 
-fn modify_other_keys_ctrl_v(parameters: &[u8]) -> CtrlVSequence {
+fn modify_other_keys_clipboard_shortcut(parameters: &[u8]) -> ShortcutSequence {
     let mut fields = parameters.split(|byte| *byte == b';');
     if parameter_number(fields.next()) != Some(27)
-        || !is_ctrl_only(parameter_number(fields.next()))
+        || !is_clipboard_modifier(parameter_number(fields.next()))
         || parameter_number(fields.next()) != Some(u16::from(b'v'))
     {
-        return CtrlVSequence::Other;
+        return ShortcutSequence::Other;
     }
-    CtrlVSequence::Press
+    ShortcutSequence::Press
 }
 
 fn parameter_number(parameter: Option<&[u8]>) -> Option<u16> {
@@ -272,7 +306,8 @@ fn parameter_number(parameter: Option<&[u8]>) -> Option<u16> {
     std::str::from_utf8(digits).ok()?.parse().ok()
 }
 
-fn is_ctrl_only(encoded_modifiers: Option<u16>) -> bool {
+fn is_clipboard_modifier(encoded_modifiers: Option<u16>) -> bool {
+    const ALT: u16 = 2;
     const CTRL: u16 = 4;
     const CAPS_LOCK: u16 = 64;
     const NUM_LOCK: u16 = 128;
@@ -280,7 +315,8 @@ fn is_ctrl_only(encoded_modifiers: Option<u16>) -> bool {
     let Some(modifiers) = encoded_modifiers.and_then(|value| value.checked_sub(1)) else {
         return false;
     };
-    modifiers & CTRL != 0 && modifiers & !(CTRL | CAPS_LOCK | NUM_LOCK) == 0
+    let shortcut = modifiers & (ALT | CTRL);
+    matches!(shortcut, ALT | CTRL) && modifiers & !(ALT | CTRL | CAPS_LOCK | NUM_LOCK) == 0
 }
 
 fn clipboard_loop(
@@ -386,6 +422,40 @@ impl Drop for RawModeGuard {
 mod tests {
     use super::*;
 
+    struct ReadProbe(Arc<AtomicBool>);
+
+    impl Read for ReadProbe {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            self.0.store(true, Ordering::SeqCst);
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn terminal_output_waits_for_the_input_relay() {
+        let read_started = Arc::new(AtomicBool::new(false));
+        let thread_read_started = Arc::clone(&read_started);
+        let (input_ready_sender, input_ready_receiver) = mpsc::sync_channel(0);
+        let (thread_started_sender, thread_started_receiver) = mpsc::sync_channel(0);
+
+        let output_thread = thread::spawn(move || {
+            thread_started_sender.send(()).unwrap();
+            relay_output_after_input_ready(
+                &mut ReadProbe(thread_read_started),
+                &mut io::sink(),
+                input_ready_receiver,
+            )
+            .unwrap();
+        });
+
+        thread_started_receiver.recv().unwrap();
+        assert!(!read_started.load(Ordering::SeqCst));
+
+        input_ready_sender.send(()).unwrap();
+        output_thread.join().unwrap();
+        assert!(read_started.load(Ordering::SeqCst));
+    }
+
     #[test]
     fn ctrl_v_byte_matches_terminal_shortcut() {
         assert_eq!(CTRL_V, b'V' & 0x1f);
@@ -420,6 +490,51 @@ mod tests {
             assert!(forwarded.is_empty(), "forwarded {sequence:?}");
             assert_eq!(paste_count, 1, "did not intercept {sequence:?}");
         }
+    }
+
+    #[test]
+    fn alt_v_terminal_encodings_are_intercepted() {
+        for sequence in [
+            b"\x1bv".as_slice(),
+            b"\x1b[118;3u",
+            b"\x1b[118:86:118;3:1u",
+            b"\x1b[118;67u",
+            b"\x1b[27;3;118~",
+        ] {
+            let mut forwarded = Vec::new();
+
+            let paste_count = InputRelay::default()
+                .forward(&mut forwarded, sequence, true)
+                .unwrap();
+
+            assert!(forwarded.is_empty(), "forwarded {sequence:?}");
+            assert_eq!(paste_count, 1, "did not intercept {sequence:?}");
+        }
+    }
+
+    #[test]
+    fn enhanced_alt_v_release_is_discarded() {
+        let mut forwarded = Vec::new();
+
+        let paste_count = InputRelay::default()
+            .forward(&mut forwarded, b"\x1b[118;3:3u", true)
+            .unwrap();
+
+        assert!(forwarded.is_empty());
+        assert_eq!(paste_count, 0);
+    }
+
+    #[test]
+    fn other_alt_keys_pass_through() {
+        let input = b"\x1bx\x1b[120;3u";
+        let mut forwarded = Vec::new();
+
+        let paste_count = InputRelay::default()
+            .forward(&mut forwarded, input, true)
+            .unwrap();
+
+        assert_eq!(forwarded, input);
+        assert_eq!(paste_count, 0);
     }
 
     #[test]
@@ -475,6 +590,19 @@ mod tests {
             .unwrap();
 
         assert_eq!(forwarded, b"\x1b[118;5u");
+        assert_eq!(paste_count, 0);
+    }
+
+    #[test]
+    fn clipboard_disabled_passes_alt_v_through() {
+        let input = b"\x1bv\x1b[118;3u";
+        let mut forwarded = Vec::new();
+
+        let paste_count = InputRelay::default()
+            .forward(&mut forwarded, input, false)
+            .unwrap();
+
+        assert_eq!(forwarded, input);
         assert_eq!(paste_count, 0);
     }
 }
