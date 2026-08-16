@@ -25,3 +25,13 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features
+
+  # Stable branch-protection target. Add every required CI job to `needs`.
+  ci-ok:
+    name: ci-ok
+    if: ${{ always() }}
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require successful CI jobs
+        run: test '${{ needs.test.result }}' = success
