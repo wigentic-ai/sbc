@@ -14,6 +14,7 @@ use crate::{Result, clipboard, transfer};
 
 const CTRL_V: u8 = 0x16;
 const ESCAPE: u8 = 0x1b;
+const INPUT_WAKE: u8 = 0;
 const MAX_ESCAPE_SEQUENCE: usize = 256;
 const TERMINAL_RESPONSE_GAP: Duration = Duration::from_millis(2);
 
@@ -452,8 +453,15 @@ fn write_paste(writer: &SharedWriter, bytes: &[u8]) {
     let mut writer = writer
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _ = writer.write_all(bytes);
-    let _ = writer.flush();
+    let _ = write_paste_bytes(&mut **writer, bytes);
+}
+
+fn write_paste_bytes<W: Write + ?Sized>(writer: &mut W, bytes: &[u8]) -> io::Result<()> {
+    writer.write_all(bytes)?;
+    // Codex batches synthetic text until it sees another input event. NUL is
+    // ignored as text but completes that batch so the pasted marker repaints.
+    writer.write_all(&[INPUT_WAKE])?;
+    writer.flush()
 }
 
 fn terminal_notice(message: &str) {
@@ -740,5 +748,14 @@ mod tests {
 
         assert_eq!(forwarded, input);
         assert_eq!(paste_count, 0);
+    }
+
+    #[test]
+    fn pasted_text_ends_with_a_wake_event() {
+        let mut written = Vec::new();
+
+        write_paste_bytes(&mut written, b"[image: /tmp/example.png]").unwrap();
+
+        assert_eq!(written, b"[image: /tmp/example.png]\0");
     }
 }
