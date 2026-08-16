@@ -8,3 +8,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # cargo-dist 0.32 generates checkout@v6 and rejects workflow drift.
+    ignore:
+      - dependency-name: actions/checkout
+        update-types:
+          - version-update:semver-major
