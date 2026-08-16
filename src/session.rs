@@ -14,9 +14,11 @@ use crate::{Result, clipboard, transfer};
 
 const CTRL_V: u8 = 0x16;
 const ESCAPE: u8 = 0x1b;
-const INPUT_WAKE: u8 = 0;
 const MAX_ESCAPE_SEQUENCE: usize = 256;
-const TERMINAL_RESPONSE_GAP: Duration = Duration::from_millis(2);
+const BRACKETED_PASTE_ENABLE: &[u8] = b"\x1b[?2004h";
+const BRACKETED_PASTE_DISABLE: &[u8] = b"\x1b[?2004l";
+const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
+const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 
 type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
@@ -45,6 +47,7 @@ pub(crate) fn run(command: SessionCommand, target: Target, clipboard_enabled: bo
     let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
     let master = Arc::new(Mutex::new(pair.master));
     let done = Arc::new(AtomicBool::new(false));
+    let bracketed_paste = Arc::new(AtomicBool::new(false));
 
     let raw_mode = RawModeGuard::enable()?;
     install_signal_restore();
@@ -55,11 +58,13 @@ pub(crate) fn run(command: SessionCommand, target: Target, clipboard_enabled: bo
     let clipboard_writer = Arc::clone(&writer);
     let clipboard_target = target.clone();
     let clipboard_done = Arc::clone(&done);
+    let clipboard_bracketed_paste = Arc::clone(&bracketed_paste);
     let clipboard_thread = thread::spawn(move || {
         clipboard_loop(
             clipboard_writer,
             clipboard_target,
             clipboard_done,
+            clipboard_bracketed_paste,
             clipboard_receiver,
         )
     });
@@ -76,9 +81,15 @@ pub(crate) fn run(command: SessionCommand, target: Target, clipboard_enabled: bo
         )
     });
 
+    let output_bracketed_paste = Arc::clone(&bracketed_paste);
     let output_thread = thread::spawn(move || {
         let mut stdout = io::stdout().lock();
-        let _ = relay_output_after_input_ready(&mut reader, &mut stdout, input_ready_receiver);
+        let _ = relay_output_after_input_ready(
+            &mut reader,
+            &mut stdout,
+            &output_bracketed_paste,
+            input_ready_receiver,
+        );
     });
 
     let resize_master = Arc::clone(&master);
@@ -103,16 +114,50 @@ pub(crate) fn run(command: SessionCommand, target: Target, clipboard_enabled: bo
 fn relay_output_after_input_ready<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
+    bracketed_paste: &AtomicBool,
     input_ready: mpsc::Receiver<()>,
 ) -> io::Result<()> {
-    // Some TUIs query terminal capabilities during their first few milliseconds
-    // and use a short response window. Do not expose those queries to the outer
-    // terminal until the return path is already listening.
+    // Some TUIs query terminal capabilities during their first few milliseconds.
+    // Do not expose those queries until the input relay can consume the outer
+    // terminal's immediate replies.
     input_ready
         .recv()
         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "input relay stopped"))?;
-    io::copy(reader, writer)?;
-    writer.flush()
+    let mut buffer = [0_u8; 8192];
+    let mut terminal_modes = TerminalModes::default();
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(());
+        }
+        terminal_modes.observe(&buffer[..count], bracketed_paste);
+        writer.write_all(&buffer[..count])?;
+        writer.flush()?;
+    }
+}
+
+#[derive(Default)]
+struct TerminalModes {
+    pending: Vec<u8>,
+}
+
+impl TerminalModes {
+    fn observe(&mut self, input: &[u8], bracketed_paste: &AtomicBool) {
+        let mut bytes = std::mem::take(&mut self.pending);
+        bytes.extend_from_slice(input);
+
+        for sequence in bytes.windows(BRACKETED_PASTE_ENABLE.len()) {
+            if sequence == BRACKETED_PASTE_ENABLE {
+                bracketed_paste.store(true, Ordering::Relaxed);
+            } else if sequence == BRACKETED_PASTE_DISABLE {
+                bracketed_paste.store(false, Ordering::Relaxed);
+            }
+        }
+
+        let keep = BRACKETED_PASTE_ENABLE.len().saturating_sub(1);
+        self.pending
+            .extend_from_slice(&bytes[bytes.len().saturating_sub(keep)..]);
+    }
 }
 
 fn input_loop(
@@ -214,11 +259,7 @@ impl InputRelay {
                     return Ok(paste_count);
                 };
                 let sequence_end = cursor + sequence_end;
-                forward_terminal_response(
-                    writer,
-                    &bytes[plain_start..cursor],
-                    &bytes[cursor..sequence_end],
-                )?;
+                writer.write_all(&bytes[plain_start..cursor])?;
                 self.terminal_response = true;
                 cursor = sequence_end;
                 plain_start = cursor;
@@ -251,11 +292,7 @@ impl InputRelay {
                     plain_start = sequence_end;
                 }
                 ShortcutSequence::Other if is_terminal_response(&bytes[cursor..sequence_end]) => {
-                    forward_terminal_response(
-                        writer,
-                        &bytes[plain_start..cursor],
-                        &bytes[cursor..sequence_end],
-                    )?;
+                    writer.write_all(&bytes[plain_start..cursor])?;
                     self.terminal_response = true;
                     plain_start = sequence_end;
                 }
@@ -271,18 +308,6 @@ impl InputRelay {
     fn take_terminal_response(&mut self) -> bool {
         std::mem::take(&mut self.terminal_response)
     }
-}
-
-fn forward_terminal_response<W: Write>(
-    writer: &mut W,
-    plain: &[u8],
-    response: &[u8],
-) -> io::Result<()> {
-    writer.write_all(plain)?;
-    writer.write_all(response)?;
-    writer.flush()?;
-    thread::sleep(TERMINAL_RESPONSE_GAP);
-    Ok(())
 }
 
 fn csi_sequence_end(input: &[u8]) -> Option<usize> {
@@ -404,6 +429,7 @@ fn clipboard_loop(
     writer: SharedWriter,
     target: Target,
     done: Arc<AtomicBool>,
+    bracketed_paste: Arc<AtomicBool>,
     receiver: mpsc::Receiver<ClipboardRequest>,
 ) {
     let mut transfer = None;
@@ -416,7 +442,7 @@ fn clipboard_loop(
             }
             ClipboardRequest::Warmup => {}
             ClipboardRequest::Paste if !done.load(Ordering::Relaxed) => {
-                paste_clipboard(&writer, &target, &mut transfer)
+                paste_clipboard(&writer, &target, &mut transfer, &bracketed_paste)
             }
             ClipboardRequest::Paste => {}
             ClipboardRequest::Shutdown => return,
@@ -428,10 +454,11 @@ fn paste_clipboard(
     writer: &SharedWriter,
     target: &Target,
     transfer: &mut Option<std::result::Result<transfer::TransferSession, String>>,
+    bracketed_paste: &AtomicBool,
 ) {
     match clipboard::read() {
         Ok(ClipboardContent::Text(text)) => {
-            write_paste(writer, text.as_bytes());
+            write_paste(writer, text.as_bytes(), bracketed_paste);
         }
         Ok(ClipboardContent::Image(image)) => match transfer.get_or_insert_with(|| {
             transfer::TransferSession::start(target).map_err(|error| error.to_string())
@@ -440,7 +467,7 @@ fn paste_clipboard(
             Ok(transfer) => match transfer.upload(&image) {
                 Ok(artifact) => {
                     let marker = format!("[image: {}]", artifact.path);
-                    write_paste(writer, marker.as_bytes());
+                    write_paste(writer, marker.as_bytes(), bracketed_paste);
                 }
                 Err(error) => terminal_notice(&format!("image paste failed: {error}")),
             },
@@ -449,18 +476,29 @@ fn paste_clipboard(
     }
 }
 
-fn write_paste(writer: &SharedWriter, bytes: &[u8]) {
+fn write_paste(writer: &SharedWriter, bytes: &[u8], bracketed_paste: &AtomicBool) {
     let mut writer = writer
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _ = write_paste_bytes(&mut **writer, bytes);
+    let _ = write_paste_bytes(
+        &mut **writer,
+        bytes,
+        bracketed_paste.load(Ordering::Relaxed),
+    );
 }
 
-fn write_paste_bytes<W: Write + ?Sized>(writer: &mut W, bytes: &[u8]) -> io::Result<()> {
+fn write_paste_bytes<W: Write + ?Sized>(
+    writer: &mut W,
+    bytes: &[u8],
+    bracketed_paste: bool,
+) -> io::Result<()> {
+    if bracketed_paste {
+        writer.write_all(BRACKETED_PASTE_START)?;
+    }
     writer.write_all(bytes)?;
-    // Codex batches synthetic text until it sees another input event. NUL is
-    // ignored as text but completes that batch so the pasted marker repaints.
-    writer.write_all(&[INPUT_WAKE])?;
+    if bracketed_paste {
+        writer.write_all(BRACKETED_PASTE_END)?;
+    }
     writer.flush()
 }
 
@@ -520,6 +558,7 @@ impl Drop for RawModeGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     struct ReadProbe(Arc<AtomicBool>);
 
@@ -546,6 +585,41 @@ mod tests {
         }
     }
 
+    struct FlushCheckingReader {
+        flushes: Arc<AtomicUsize>,
+        sent: bool,
+    }
+
+    impl Read for FlushCheckingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.sent {
+                assert_eq!(self.flushes.load(Ordering::SeqCst), 1);
+                return Ok(0);
+            }
+            self.sent = true;
+            let bytes = b"first redraw";
+            buffer[..bytes.len()].copy_from_slice(bytes);
+            Ok(bytes.len())
+        }
+    }
+
+    struct FlushProbe {
+        flushes: Arc<AtomicUsize>,
+        writes: Vec<Vec<u8>>,
+    }
+
+    impl Write for FlushProbe {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.writes.push(buffer.to_vec());
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
     #[test]
     fn terminal_output_waits_for_the_input_relay() {
         let read_started = Arc::new(AtomicBool::new(false));
@@ -555,9 +629,11 @@ mod tests {
 
         let output_thread = thread::spawn(move || {
             thread_started_sender.send(()).unwrap();
+            let bracketed_paste = AtomicBool::new(false);
             relay_output_after_input_ready(
                 &mut ReadProbe(thread_read_started),
                 &mut io::sink(),
+                &bracketed_paste,
                 input_ready_receiver,
             )
             .unwrap();
@@ -569,6 +645,46 @@ mod tests {
         input_ready_sender.send(()).unwrap();
         output_thread.join().unwrap();
         assert!(read_started.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn terminal_output_flushes_each_read() {
+        let (input_ready_sender, input_ready_receiver) = mpsc::sync_channel(1);
+        input_ready_sender.send(()).unwrap();
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let mut input = FlushCheckingReader {
+            flushes: Arc::clone(&flushes),
+            sent: false,
+        };
+        let mut output = FlushProbe {
+            flushes,
+            writes: Vec::new(),
+        };
+        let bracketed_paste = AtomicBool::new(false);
+
+        relay_output_after_input_ready(
+            &mut input,
+            &mut output,
+            &bracketed_paste,
+            input_ready_receiver,
+        )
+        .unwrap();
+
+        assert_eq!(output.writes, [b"first redraw".as_slice()]);
+    }
+
+    #[test]
+    fn terminal_modes_track_bracketed_paste_across_reads() {
+        let bracketed_paste = AtomicBool::new(false);
+        let mut modes = TerminalModes::default();
+
+        modes.observe(b"before\x1b[?20", &bracketed_paste);
+        modes.observe(b"04hafter", &bracketed_paste);
+        assert!(bracketed_paste.load(Ordering::Relaxed));
+
+        modes.observe(b"\x1b[?200", &bracketed_paste);
+        modes.observe(b"4l", &bracketed_paste);
+        assert!(!bracketed_paste.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -683,7 +799,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_responses_are_forwarded_individually() {
+    fn terminal_responses_do_not_become_agent_input() {
         let keyboard = b"\x1b[?0u";
         let attributes = b"\x1b[?61;4;6;7;14;21;22;23;24;28;32;42;52c";
         let background = b"\x1b]11;rgb:0000/0000/0000\x1b\\";
@@ -693,36 +809,30 @@ mod tests {
 
         let paste_count = relay.forward(&mut forwarded, &input, true).unwrap();
 
-        assert_eq!(
-            forwarded.writes,
-            [keyboard.as_slice(), attributes, background]
-        );
+        assert!(forwarded.writes.is_empty());
         assert_eq!(paste_count, 0);
         assert!(relay.take_terminal_response());
         assert!(!relay.take_terminal_response());
     }
 
     #[test]
-    fn osc_terminal_response_can_span_reads() {
+    fn captured_windows_terminal_replies_do_not_become_agent_input() {
         let mut relay = InputRelay::default();
         let mut forwarded = WriteRecorder::default();
+        let reads = [
+            b"\x1b[?61;4;6;7;14;21;22;23;24;28;32".as_slice(),
+            b";42;52c\x1b]11;rgb:0000/00",
+            b"00/0000\x1b\\",
+        ];
+        let mut paste_count = 0;
 
-        let first_count = relay
-            .forward(&mut forwarded, b"before\x1b]11;rgb:0000/", true)
-            .unwrap();
-        let second_count = relay
-            .forward(&mut forwarded, b"0000/0000\x1b\\after", true)
-            .unwrap();
+        for read in reads {
+            paste_count += relay.forward(&mut forwarded, read, true).unwrap();
+        }
 
-        assert_eq!(
-            forwarded.writes,
-            [
-                b"before".as_slice(),
-                b"\x1b]11;rgb:0000/0000/0000\x1b\\",
-                b"after"
-            ]
-        );
-        assert_eq!(first_count + second_count, 0);
+        assert!(forwarded.writes.is_empty());
+        assert_eq!(paste_count, 0);
+        assert!(relay.take_terminal_response());
     }
 
     #[test]
@@ -751,11 +861,20 @@ mod tests {
     }
 
     #[test]
-    fn pasted_text_ends_with_a_wake_event() {
+    fn pasted_text_is_written_unchanged() {
         let mut written = Vec::new();
 
-        write_paste_bytes(&mut written, b"[image: /tmp/example.png]").unwrap();
+        write_paste_bytes(&mut written, b"clipboard text", false).unwrap();
 
-        assert_eq!(written, b"[image: /tmp/example.png]\0");
+        assert_eq!(written, b"clipboard text");
+    }
+
+    #[test]
+    fn pasted_text_uses_bracketed_protocol_when_enabled() {
+        let mut written = Vec::new();
+
+        write_paste_bytes(&mut written, b"clipboard text", true).unwrap();
+
+        assert_eq!(written, b"\x1b[200~clipboard text\x1b[201~");
     }
 }
