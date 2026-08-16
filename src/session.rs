@@ -1,6 +1,6 @@
 use std::io::{self, IsTerminal, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -14,6 +14,15 @@ use crate::transfer::Artifact;
 use crate::{Result, clipboard, transfer};
 
 const CTRL_V: u8 = 0x16;
+const ESCAPE: u8 = 0x1b;
+const MAX_CSI_SEQUENCE: usize = 64;
+
+type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
+
+enum ClipboardRequest {
+    Paste,
+    Shutdown,
+}
 
 pub(crate) fn run(command: SessionCommand, target: Target, clipboard_enabled: bool) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
@@ -31,7 +40,7 @@ pub(crate) fn run(command: SessionCommand, target: Target, clipboard_enabled: bo
     drop(pair.slave);
 
     let mut reader = pair.master.try_clone_reader()?;
-    let writer = pair.master.take_writer()?;
+    let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
     let master = Arc::new(Mutex::new(pair.master));
     let done = Arc::new(AtomicBool::new(false));
     let artifacts = Arc::new(Mutex::new(Vec::<Artifact>::new()));
@@ -45,9 +54,26 @@ pub(crate) fn run(command: SessionCommand, target: Target, clipboard_enabled: bo
         let _ = stdout.flush();
     });
 
-    let input_target = target.clone();
-    let input_artifacts = Arc::clone(&artifacts);
-    thread::spawn(move || input_loop(writer, input_target, input_artifacts, clipboard_enabled));
+    // Clipboard reads and sandbox uploads can take seconds. Keep them off the
+    // input relay so terminal capability replies and keystrokes keep flowing.
+    let (clipboard_sender, clipboard_receiver) = mpsc::channel();
+    let clipboard_writer = Arc::clone(&writer);
+    let clipboard_target = target.clone();
+    let clipboard_artifacts = Arc::clone(&artifacts);
+    let clipboard_done = Arc::clone(&done);
+    let clipboard_thread = thread::spawn(move || {
+        clipboard_loop(
+            clipboard_writer,
+            clipboard_target,
+            clipboard_artifacts,
+            clipboard_done,
+            clipboard_receiver,
+        )
+    });
+
+    let input_writer = Arc::clone(&writer);
+    let input_clipboard_sender = clipboard_sender.clone();
+    thread::spawn(move || input_loop(input_writer, input_clipboard_sender, clipboard_enabled));
 
     let resize_master = Arc::clone(&master);
     let resize_done = Arc::clone(&done);
@@ -55,6 +81,9 @@ pub(crate) fn run(command: SessionCommand, target: Target, clipboard_enabled: bo
 
     let status = child.wait()?;
     done.store(true, Ordering::Relaxed);
+    let _ = clipboard_sender.send(ClipboardRequest::Shutdown);
+    let _ = clipboard_thread.join();
+    drop(writer);
     drop(master);
     let _ = output_thread.join();
     drop(raw_mode);
@@ -71,51 +100,216 @@ pub(crate) fn run(command: SessionCommand, target: Target, clipboard_enabled: bo
 }
 
 fn input_loop(
-    mut writer: Box<dyn Write + Send>,
-    target: Target,
-    artifacts: Arc<Mutex<Vec<Artifact>>>,
+    writer: SharedWriter,
+    clipboard_sender: mpsc::Sender<ClipboardRequest>,
     clipboard_enabled: bool,
 ) {
     let mut stdin = io::stdin().lock();
     let mut buffer = [0_u8; 1024];
+    let mut relay = InputRelay::default();
     loop {
         let count = match stdin.read(&mut buffer) {
             Ok(0) | Err(_) => return,
             Ok(count) => count,
         };
-        for segment in buffer[..count].split_inclusive(|byte| *byte == CTRL_V) {
-            let intercepted = clipboard_enabled && segment.last() == Some(&CTRL_V);
-            let plain = if intercepted {
-                &segment[..segment.len() - 1]
-            } else {
-                segment
+        let paste_count = {
+            let mut writer = writer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Ok(paste_count) = relay.forward(&mut *writer, &buffer[..count], clipboard_enabled)
+            else {
+                return;
             };
-            if writer.write_all(plain).is_err() {
+            if writer.flush().is_err() {
                 return;
             }
-            if intercepted {
-                paste_clipboard(&mut writer, &target, &artifacts);
+            paste_count
+        };
+        for _ in 0..paste_count {
+            if clipboard_sender.send(ClipboardRequest::Paste).is_err() {
+                return;
             }
-        }
-        if writer.flush().is_err() {
-            return;
         }
     }
 }
 
-fn paste_clipboard(
-    writer: &mut Box<dyn Write + Send>,
-    target: &Target,
-    artifacts: &Arc<Mutex<Vec<Artifact>>>,
+#[derive(Default)]
+struct InputRelay {
+    pending: Vec<u8>,
+}
+
+impl InputRelay {
+    fn forward<W: Write>(
+        &mut self,
+        writer: &mut W,
+        input: &[u8],
+        clipboard_enabled: bool,
+    ) -> io::Result<usize> {
+        if !clipboard_enabled {
+            if !self.pending.is_empty() {
+                writer.write_all(&self.pending)?;
+                self.pending.clear();
+            }
+            writer.write_all(input)?;
+            return Ok(0);
+        }
+
+        let mut bytes = std::mem::take(&mut self.pending);
+        bytes.extend_from_slice(input);
+        let mut plain_start = 0;
+        let mut cursor = 0;
+        let mut paste_count = 0;
+
+        while cursor < bytes.len() {
+            if bytes[cursor] == CTRL_V {
+                writer.write_all(&bytes[plain_start..cursor])?;
+                paste_count += 1;
+                cursor += 1;
+                plain_start = cursor;
+                continue;
+            }
+
+            if bytes[cursor] != ESCAPE || bytes.get(cursor + 1) != Some(&b'[') {
+                cursor += 1;
+                continue;
+            }
+
+            let Some(sequence_end) = csi_sequence_end(&bytes[cursor..]) else {
+                if bytes.len() - cursor > MAX_CSI_SEQUENCE {
+                    cursor += 1;
+                    continue;
+                }
+                writer.write_all(&bytes[plain_start..cursor])?;
+                self.pending.extend_from_slice(&bytes[cursor..]);
+                return Ok(paste_count);
+            };
+            let sequence_end = cursor + sequence_end;
+            match ctrl_v_sequence(&bytes[cursor..sequence_end]) {
+                CtrlVSequence::Press => {
+                    writer.write_all(&bytes[plain_start..cursor])?;
+                    paste_count += 1;
+                    plain_start = sequence_end;
+                }
+                CtrlVSequence::Release => {
+                    writer.write_all(&bytes[plain_start..cursor])?;
+                    plain_start = sequence_end;
+                }
+                CtrlVSequence::Other => {}
+            }
+            cursor = sequence_end;
+        }
+
+        writer.write_all(&bytes[plain_start..])?;
+        Ok(paste_count)
+    }
+}
+
+fn csi_sequence_end(input: &[u8]) -> Option<usize> {
+    debug_assert!(input.starts_with(b"\x1b["));
+    input[2..]
+        .iter()
+        .position(|byte| (0x40..=0x7e).contains(byte))
+        .map(|index| index + 3)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CtrlVSequence {
+    Press,
+    Release,
+    Other,
+}
+
+fn ctrl_v_sequence(sequence: &[u8]) -> CtrlVSequence {
+    let Some((&final_byte, body)) = sequence.split_last() else {
+        return CtrlVSequence::Other;
+    };
+    let Some(parameters) = body.strip_prefix(b"\x1b[") else {
+        return CtrlVSequence::Other;
+    };
+
+    match final_byte {
+        // Kitty's keyboard protocol, used by current Windows Terminal.
+        b'u' => kitty_ctrl_v(parameters),
+        // XTerm's modifyOtherKeys encoding, used by some nested terminals.
+        b'~' => modify_other_keys_ctrl_v(parameters),
+        _ => CtrlVSequence::Other,
+    }
+}
+
+fn kitty_ctrl_v(parameters: &[u8]) -> CtrlVSequence {
+    let mut fields = parameters.split(|byte| *byte == b';');
+    if parameter_number(fields.next()) != Some(u16::from(b'v')) {
+        return CtrlVSequence::Other;
+    }
+    let Some(modifiers_and_event) = fields.next() else {
+        return CtrlVSequence::Other;
+    };
+    let mut parts = modifiers_and_event.split(|byte| *byte == b':');
+    if !is_ctrl_only(parameter_number(parts.next())) {
+        return CtrlVSequence::Other;
+    }
+
+    match parameter_number(parts.next()).unwrap_or(1) {
+        1 | 2 => CtrlVSequence::Press,
+        3 => CtrlVSequence::Release,
+        _ => CtrlVSequence::Other,
+    }
+}
+
+fn modify_other_keys_ctrl_v(parameters: &[u8]) -> CtrlVSequence {
+    let mut fields = parameters.split(|byte| *byte == b';');
+    if parameter_number(fields.next()) != Some(27)
+        || !is_ctrl_only(parameter_number(fields.next()))
+        || parameter_number(fields.next()) != Some(u16::from(b'v'))
+    {
+        return CtrlVSequence::Other;
+    }
+    CtrlVSequence::Press
+}
+
+fn parameter_number(parameter: Option<&[u8]>) -> Option<u16> {
+    let digits = parameter?.split(|byte| *byte == b':').next()?;
+    std::str::from_utf8(digits).ok()?.parse().ok()
+}
+
+fn is_ctrl_only(encoded_modifiers: Option<u16>) -> bool {
+    const CTRL: u16 = 4;
+    const CAPS_LOCK: u16 = 64;
+    const NUM_LOCK: u16 = 128;
+
+    let Some(modifiers) = encoded_modifiers.and_then(|value| value.checked_sub(1)) else {
+        return false;
+    };
+    modifiers & CTRL != 0 && modifiers & !(CTRL | CAPS_LOCK | NUM_LOCK) == 0
+}
+
+fn clipboard_loop(
+    writer: SharedWriter,
+    target: Target,
+    artifacts: Arc<Mutex<Vec<Artifact>>>,
+    done: Arc<AtomicBool>,
+    receiver: mpsc::Receiver<ClipboardRequest>,
 ) {
+    while let Ok(request) = receiver.recv() {
+        match request {
+            ClipboardRequest::Paste if !done.load(Ordering::Relaxed) => {
+                paste_clipboard(&writer, &target, &artifacts)
+            }
+            ClipboardRequest::Paste => {}
+            ClipboardRequest::Shutdown => return,
+        }
+    }
+}
+
+fn paste_clipboard(writer: &SharedWriter, target: &Target, artifacts: &Arc<Mutex<Vec<Artifact>>>) {
     match clipboard::read() {
         Ok(ClipboardContent::Text(text)) => {
-            let _ = writer.write_all(text.as_bytes());
+            write_paste(writer, text.as_bytes());
         }
         Ok(ClipboardContent::Image(image)) => match transfer::upload(target, &image) {
             Ok(artifact) => {
                 let marker = format!("[image: {}]", artifact.path);
-                let _ = writer.write_all(marker.as_bytes());
+                write_paste(writer, marker.as_bytes());
                 artifacts
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -125,6 +319,14 @@ fn paste_clipboard(
         },
         Err(error) => terminal_notice(&format!("paste failed: {error}")),
     }
+}
+
+fn write_paste(writer: &SharedWriter, bytes: &[u8]) {
+    let mut writer = writer
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _ = writer.write_all(bytes);
+    let _ = writer.flush();
 }
 
 fn terminal_notice(message: &str) {
@@ -187,5 +389,92 @@ mod tests {
     #[test]
     fn ctrl_v_byte_matches_terminal_shortcut() {
         assert_eq!(CTRL_V, b'V' & 0x1f);
+    }
+
+    #[test]
+    fn enhanced_ctrl_v_is_intercepted() {
+        let mut forwarded = Vec::new();
+        let mut relay = InputRelay::default();
+
+        let paste_count = relay.forward(&mut forwarded, b"\x1b[118;5u", true).unwrap();
+
+        assert!(forwarded.is_empty());
+        assert_eq!(paste_count, 1);
+    }
+
+    #[test]
+    fn ctrl_v_terminal_encodings_are_intercepted() {
+        for sequence in [
+            b"\x16".as_slice(),
+            b"\x1b[118;5u",
+            b"\x1b[118:86:118;5:1u",
+            b"\x1b[118;69u",
+            b"\x1b[27;5;118~",
+        ] {
+            let mut forwarded = Vec::new();
+
+            let paste_count = InputRelay::default()
+                .forward(&mut forwarded, sequence, true)
+                .unwrap();
+
+            assert!(forwarded.is_empty(), "forwarded {sequence:?}");
+            assert_eq!(paste_count, 1, "did not intercept {sequence:?}");
+        }
+    }
+
+    #[test]
+    fn enhanced_ctrl_v_release_is_discarded() {
+        let mut forwarded = Vec::new();
+
+        let paste_count = InputRelay::default()
+            .forward(&mut forwarded, b"\x1b[118;5:3u", true)
+            .unwrap();
+
+        assert!(forwarded.is_empty());
+        assert_eq!(paste_count, 0);
+    }
+
+    #[test]
+    fn enhanced_ctrl_v_can_span_reads() {
+        let mut forwarded = Vec::new();
+        let mut paste_count = 0;
+        let mut relay = InputRelay::default();
+
+        paste_count += relay
+            .forward(&mut forwarded, b"before\x1b[118;", true)
+            .unwrap();
+        paste_count += relay.forward(&mut forwarded, b"5uafter", true).unwrap();
+
+        assert_eq!(forwarded, b"beforeafter");
+        assert_eq!(paste_count, 1);
+    }
+
+    #[test]
+    fn terminal_responses_follow_ctrl_v_without_being_delayed() {
+        let terminal_responses = concat!(
+            "\x1b[?61;4;6;7;14;21;22;23;24;28;32;42;52c",
+            "\x1b]11;rgb:0000/0000/0000\x1b\\"
+        );
+        let input = format!("\x16{terminal_responses}");
+        let mut forwarded = Vec::new();
+
+        let paste_count = InputRelay::default()
+            .forward(&mut forwarded, input.as_bytes(), true)
+            .unwrap();
+
+        assert_eq!(forwarded, terminal_responses.as_bytes());
+        assert_eq!(paste_count, 1);
+    }
+
+    #[test]
+    fn clipboard_disabled_passes_enhanced_ctrl_v_through() {
+        let mut forwarded = Vec::new();
+
+        let paste_count = InputRelay::default()
+            .forward(&mut forwarded, b"\x1b[118;5u", false)
+            .unwrap();
+
+        assert_eq!(forwarded, b"\x1b[118;5u");
+        assert_eq!(paste_count, 0);
     }
 }
