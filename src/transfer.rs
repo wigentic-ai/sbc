@@ -141,6 +141,20 @@ fn receiver_script(directory: &str) -> String {
 mod tests {
     use super::*;
 
+    fn native_test_directory() -> String {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!(
+                "sbc-transfer-test-{}-{timestamp}",
+                std::process::id()
+            ))
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
     #[test]
     fn sandbox_artifacts_stay_in_tmp() {
         let image = crate::clipboard::_owned_image(vec![0, 0, 0, 255], 1, 1);
@@ -154,7 +168,7 @@ mod tests {
 
     #[test]
     fn reuses_one_transfer_process_and_cleans_its_directory() {
-        let directory = session_directory().unwrap();
+        let directory = native_test_directory();
         let script = receiver_script(&directory);
         let mut command = Command::new("sh");
         command.args(["-c", &script]);
