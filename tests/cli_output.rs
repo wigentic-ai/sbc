@@ -19,6 +19,6 @@ fn help_is_successful_output() {
 fn version_is_successful_output() {
     let output = run("--version");
     assert!(output.status.success());
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "sbc 0.1.1\n");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "sbc 0.1.2\n");
     assert!(output.stderr.is_empty());
 }
