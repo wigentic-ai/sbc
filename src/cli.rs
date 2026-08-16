@@ -24,7 +24,7 @@ pub(crate) struct ConnectArgs {
     #[arg(long, conflicts_with = "host")]
     pub(crate) local: bool,
 
-    /// Disable Ctrl+V clipboard bridging
+    /// Disable clipboard shortcut bridging
     #[arg(long, env = "SBC_NO_CLIPBOARD")]
     pub(crate) no_clipboard: bool,
 
